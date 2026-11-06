@@ -11,7 +11,7 @@ import (
 )
 
 func TestSearchRedemptionsFiltersAndPaginates(t *testing.T) {
-	require.NoError(t, DB.AutoMigrate(&Redemption{}))
+	require.NoError(t, DB.AutoMigrate(&Redemption{}, &User{}))
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
@@ -102,7 +102,7 @@ func TestSearchRedemptionsFiltersAndPaginates(t *testing.T) {
 
 func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	t.Helper()
-	require.NoError(t, DB.AutoMigrate(&Redemption{}))
+	require.NoError(t, DB.AutoMigrate(&Redemption{}, &User{}))
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
@@ -123,6 +123,31 @@ func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	}
 	require.NoError(t, DB.Create(redemption).Error)
 	return user.Id, key
+}
+
+func TestRedeemCreditsFirstTopupRebatesInviterOnce(t *testing.T) {
+	setupRedeemFixture(t, 1000)
+
+	inviter := &User{Username: "inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0}
+	invitee := &User{Username: "invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0}
+	require.NoError(t, DB.Create(inviter).Error)
+	invitee.InviterId = inviter.Id
+	require.NoError(t, DB.Create(invitee).Error)
+
+	key1 := "20000000000000000000000000000001"
+	key2 := "20000000000000000000000000000002"
+	require.NoError(t, DB.Create(&Redemption{Name: "rebate-1", Key: key1, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+	require.NoError(t, DB.Create(&Redemption{Name: "rebate-2", Key: key2, Status: common.RedemptionCodeStatusEnabled, Quota: 2000, CreatedTime: common.GetTimestamp()}).Error)
+
+	_, err := Redeem(key1, invitee.Id)
+	require.NoError(t, err)
+	_, err = Redeem(key2, invitee.Id)
+	require.NoError(t, err)
+
+	var got User
+	require.NoError(t, DB.First(&got, inviter.Id).Error)
+	assert.Equal(t, 100, got.AffQuota)
+	assert.Equal(t, 100, got.AffHistoryQuota)
 }
 
 func TestRedeemCreditsQuotaExactlyOnce(t *testing.T) {

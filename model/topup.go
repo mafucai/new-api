@@ -84,6 +84,41 @@ func ValidateTopUpQuotaCapacity(userId int, creditedQuota int) error {
 	return nil
 }
 
+func creditFirstTopupRebate(tx *gorm.DB, userId int, creditedQuota int) error {
+	var user User
+	if err := tx.Select("id", "inviter_id", "first_topup_rebated").First(&user, userId).Error; err != nil {
+		return err
+	}
+	if user.InviterId == 0 || user.FirstTopupRebated != 0 || creditedQuota <= 0 {
+		return nil
+	}
+
+	claimed := tx.Model(&User{}).Where("id = ? AND first_topup_rebated = ?", userId, 0).
+		Update("first_topup_rebated", 1)
+	if claimed.Error != nil {
+		return claimed.Error
+	}
+	if claimed.RowsAffected == 0 {
+		return nil
+	}
+
+	rebate := creditedQuota / 10
+	if rebate <= 0 {
+		return nil
+	}
+	result := tx.Model(&User{}).Where("id = ?", user.InviterId).Updates(map[string]any{
+		"aff_quota":   gorm.Expr("aff_quota + ?", rebate),
+		"aff_history": gorm.Expr("aff_history + ?", rebate),
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // creditTopUpQuota atomically enforces the wallet ceiling while adding quota.
 // Keeping the predicate and increment in one UPDATE prevents two
 // concurrent callbacks from both passing a separate read/check.
@@ -104,6 +139,9 @@ func creditTopUpQuota(tx *gorm.DB, userId int, creditedQuota int, updates map[st
 		return result.Error
 	}
 	if result.RowsAffected == 1 {
+		if err := creditFirstTopupRebate(tx, userId, creditedQuota); err != nil {
+			return err
+		}
 		return nil
 	}
 
