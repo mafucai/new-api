@@ -127,8 +127,10 @@ var TurnstileSecretKey = ""
 var TelegramBotToken = ""
 var TelegramBotName = ""
 
-var QuotaForNewUser = 0
-var QuotaForInviter = 0
+// Site defaults: 500000 quota = 1 credit = 1 CNY at the configured 1:1 rate.
+// Persisted administrator options continue to override these defaults.
+var QuotaForNewUser = 500000
+var QuotaForInviter = 500000
 var QuotaForInvitee = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
