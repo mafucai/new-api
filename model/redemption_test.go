@@ -128,8 +128,8 @@ func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 func TestRedeemCreditsFirstTopupRebatesInviterOnce(t *testing.T) {
 	setupRedeemFixture(t, 1000)
 
-	inviter := &User{Username: "inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0}
-	invitee := &User{Username: "invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0}
+	inviter := &User{Username: "inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "inviter-aff"}
+	invitee := &User{Username: "invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "invitee-aff"}
 	require.NoError(t, DB.Create(inviter).Error)
 	invitee.InviterId = inviter.Id
 	require.NoError(t, DB.Create(invitee).Error)
