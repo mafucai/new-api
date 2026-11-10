@@ -93,6 +93,15 @@ func creditFirstTopupRebate(tx *gorm.DB, userId int, creditedQuota int) error {
 		return nil
 	}
 
+	rebate := creditedQuota / 10
+	if rebate <= 0 {
+		return nil
+	}
+
+	// Compare-and-swap the one-shot flag first, so concurrent top-ups cannot
+	// both credit the inviter. The claim is released below when the payout
+	// cannot be made, which keeps the rebate retryable instead of silently
+	// dropped.
 	claimed := tx.Model(&User{}).Where("id = ? AND first_topup_rebated = ?", userId, 0).
 		Update("first_topup_rebated", 1)
 	if claimed.Error != nil {
@@ -102,19 +111,34 @@ func creditFirstTopupRebate(tx *gorm.DB, userId int, creditedQuota int) error {
 		return nil
 	}
 
-	rebate := creditedQuota / 10
-	if rebate <= 0 {
-		return nil
+	releaseClaim := func() {
+		if undo := tx.Model(&User{}).Where("id = ?", userId).
+			Update("first_topup_rebated", 0); undo.Error != nil {
+			common.SysError(common.LogText(
+				"failed to release first top-up rebate claim for user %d: %s",
+				userId, undo.Error.Error()))
+		}
 	}
+
 	result := tx.Model(&User{}).Where("id = ?", user.InviterId).Updates(map[string]any{
 		"aff_quota":   gorm.Expr("aff_quota + ?", rebate),
 		"aff_history": gorm.Expr("aff_history + ?", rebate),
 	})
 	if result.Error != nil {
-		return result.Error
+		// Never fail the payer's top-up over an affiliate payout.
+		common.SysError(common.LogText(
+			"first top-up rebate failed: inviter %d for user %d: %s",
+			user.InviterId, userId, result.Error.Error()))
+		releaseClaim()
+		return nil
 	}
 	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+		// The inviter is gone, so there is nobody to pay.
+		common.SysError(common.LogText(
+			"first top-up rebate skipped: inviter %d unavailable for user %d (rebate %d)",
+			user.InviterId, userId, rebate))
+		releaseClaim()
+		return nil
 	}
 	return nil
 }
