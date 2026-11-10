@@ -210,6 +210,29 @@ func TestRedeemRebateClaimReleasedWhenInviterMissing(t *testing.T) {
 	assert.Equal(t, 100, paid.AffQuota)
 }
 
+// Rows created before the column existed hold NULL. A NULL claim must still be
+// treated as "not yet rebated", otherwise those users never pay their inviter.
+func TestRedeemRebatesWhenClaimColumnIsNull(t *testing.T) {
+	setupRedeemFixture(t, 500)
+
+	inviter := &User{Username: "null-inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "null-inviter-aff"}
+	invitee := &User{Username: "null-invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "null-invitee-aff"}
+	require.NoError(t, DB.Create(inviter).Error)
+	require.NoError(t, DB.Create(invitee).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", invitee.Id).
+		Updates(map[string]any{"inviter_id": inviter.Id, "first_topup_rebated": nil}).Error)
+
+	key := "20000000000000000000000000000013"
+	require.NoError(t, DB.Create(&Redemption{Name: "null-rebate", Key: key, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+
+	_, err := Redeem(key, invitee.Id)
+	require.NoError(t, err)
+
+	var paid User
+	require.NoError(t, DB.First(&paid, inviter.Id).Error)
+	assert.Equal(t, 100, paid.AffQuota, "a NULL claim must still pay the inviter")
+}
+
 func TestRedeemCreditsQuotaExactlyOnce(t *testing.T) {
 	userId, key := setupRedeemFixture(t, 500)
 

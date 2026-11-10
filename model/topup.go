@@ -102,7 +102,10 @@ func creditFirstTopupRebate(tx *gorm.DB, userId int, creditedQuota int) error {
 	// both credit the inviter. The claim is released below when the payout
 	// cannot be made, which keeps the rebate retryable instead of silently
 	// dropped.
-	claimed := tx.Model(&User{}).Where("id = ? AND first_topup_rebated = ?", userId, 0).
+	// Rows created before the column existed hold NULL, which never matches
+	// "= 0", so both states must be claimable.
+	claimed := tx.Model(&User{}).
+		Where("id = ? AND (first_topup_rebated = ? OR first_topup_rebated IS NULL)", userId, 0).
 		Update("first_topup_rebated", 1)
 	if claimed.Error != nil {
 		return claimed.Error
