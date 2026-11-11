@@ -11,7 +11,7 @@ import (
 )
 
 func TestSearchRedemptionsFiltersAndPaginates(t *testing.T) {
-	require.NoError(t, DB.AutoMigrate(&Redemption{}))
+	require.NoError(t, DB.AutoMigrate(&Redemption{}, &User{}))
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
@@ -102,7 +102,7 @@ func TestSearchRedemptionsFiltersAndPaginates(t *testing.T) {
 
 func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	t.Helper()
-	require.NoError(t, DB.AutoMigrate(&Redemption{}))
+	require.NoError(t, DB.AutoMigrate(&Redemption{}, &User{}))
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
@@ -123,6 +123,114 @@ func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	}
 	require.NoError(t, DB.Create(redemption).Error)
 	return user.Id, key
+}
+
+func TestRedeemCreditsFirstTopupRebatesInviterOnce(t *testing.T) {
+	setupRedeemFixture(t, 1000)
+
+	inviter := &User{Username: "inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "inviter-aff"}
+	invitee := &User{Username: "invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "invitee-aff"}
+	require.NoError(t, DB.Create(inviter).Error)
+	invitee.InviterId = inviter.Id
+	require.NoError(t, DB.Create(invitee).Error)
+
+	key1 := "20000000000000000000000000000001"
+	key2 := "20000000000000000000000000000002"
+	require.NoError(t, DB.Create(&Redemption{Name: "rebate-1", Key: key1, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+	require.NoError(t, DB.Create(&Redemption{Name: "rebate-2", Key: key2, Status: common.RedemptionCodeStatusEnabled, Quota: 2000, CreatedTime: common.GetTimestamp()}).Error)
+
+	_, err := Redeem(key1, invitee.Id)
+	require.NoError(t, err)
+	_, err = Redeem(key2, invitee.Id)
+	require.NoError(t, err)
+
+	var got User
+	require.NoError(t, DB.First(&got, inviter.Id).Error)
+	assert.Equal(t, 100, got.AffQuota)
+	assert.Equal(t, 100, got.AffHistoryQuota)
+}
+
+// A deleted inviter must never block the invitee's own top-up: the payer is
+// credited, the rebate is skipped, and the one-shot claim stays releasable.
+func TestRedeemSucceedsWhenInviterIsGone(t *testing.T) {
+	userId, key := setupRedeemFixture(t, 500)
+
+	invitee := &User{Username: "orphan-invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "orphan-aff"}
+	require.NoError(t, DB.Create(invitee).Error)
+	invitee.InviterId = 999999
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", invitee.Id).Update("inviter_id", 999999).Error)
+
+	redeemKey := "20000000000000000000000000000010"
+	require.NoError(t, DB.Create(&Redemption{Name: "orphan-rebate", Key: redeemKey, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+
+	quota, err := Redeem(redeemKey, invitee.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1000, quota)
+
+	var paid User
+	require.NoError(t, DB.First(&paid, invitee.Id).Error)
+	assert.Equal(t, 1000, paid.Quota, "payer must keep the credit")
+	assert.Equal(t, 0, paid.FirstTopupRebated, "claim must be released so a real inviter can still be paid")
+
+	_ = userId
+	_ = key
+}
+
+// A rebate that cannot be paid must not consume the one-shot claim, so a later
+// top-up with a valid inviter still pays.
+func TestRedeemRebateClaimReleasedWhenInviterMissing(t *testing.T) {
+	setupRedeemFixture(t, 500)
+
+	invitee := &User{Username: "retry-invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "retry-aff"}
+	require.NoError(t, DB.Create(invitee).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", invitee.Id).Update("inviter_id", 888888).Error)
+
+	key := "20000000000000000000000000000011"
+	require.NoError(t, DB.Create(&Redemption{Name: "retry-rebate", Key: key, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+
+	_, err := Redeem(key, invitee.Id)
+	require.NoError(t, err)
+
+	var got User
+	require.NoError(t, DB.First(&got, invitee.Id).Error)
+	assert.Equal(t, 0, got.FirstTopupRebated)
+
+	// Now attach a real inviter; the next top-up pays the first-time rebate.
+	inviter := &User{Username: "late-inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "late-aff"}
+	require.NoError(t, DB.Create(inviter).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", invitee.Id).Update("inviter_id", inviter.Id).Error)
+
+	key2 := "20000000000000000000000000000012"
+	require.NoError(t, DB.Create(&Redemption{Name: "retry-rebate-2", Key: key2, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+	_, err = Redeem(key2, invitee.Id)
+	require.NoError(t, err)
+
+	var paid User
+	require.NoError(t, DB.First(&paid, inviter.Id).Error)
+	assert.Equal(t, 100, paid.AffQuota)
+}
+
+// Rows created before the column existed hold NULL. A NULL claim must still be
+// treated as "not yet rebated", otherwise those users never pay their inviter.
+func TestRedeemRebatesWhenClaimColumnIsNull(t *testing.T) {
+	setupRedeemFixture(t, 500)
+
+	inviter := &User{Username: "null-inviter", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "null-inviter-aff"}
+	invitee := &User{Username: "null-invitee", Password: "password", Status: common.UserStatusEnabled, Quota: 0, AffCode: "null-invitee-aff"}
+	require.NoError(t, DB.Create(inviter).Error)
+	require.NoError(t, DB.Create(invitee).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", invitee.Id).
+		Updates(map[string]any{"inviter_id": inviter.Id, "first_topup_rebated": nil}).Error)
+
+	key := "20000000000000000000000000000013"
+	require.NoError(t, DB.Create(&Redemption{Name: "null-rebate", Key: key, Status: common.RedemptionCodeStatusEnabled, Quota: 1000, CreatedTime: common.GetTimestamp()}).Error)
+
+	_, err := Redeem(key, invitee.Id)
+	require.NoError(t, err)
+
+	var paid User
+	require.NoError(t, DB.First(&paid, inviter.Id).Error)
+	assert.Equal(t, 100, paid.AffQuota, "a NULL claim must still pay the inviter")
 }
 
 func TestRedeemCreditsQuotaExactlyOnce(t *testing.T) {

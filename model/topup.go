@@ -84,6 +84,68 @@ func ValidateTopUpQuotaCapacity(userId int, creditedQuota int) error {
 	return nil
 }
 
+func creditFirstTopupRebate(tx *gorm.DB, userId int, creditedQuota int) error {
+	var user User
+	if err := tx.Select("id", "inviter_id", "first_topup_rebated").First(&user, userId).Error; err != nil {
+		return err
+	}
+	if user.InviterId == 0 || user.FirstTopupRebated != 0 || creditedQuota <= 0 {
+		return nil
+	}
+
+	rebate := creditedQuota / 10
+	if rebate <= 0 {
+		return nil
+	}
+
+	// Compare-and-swap the one-shot flag first, so concurrent top-ups cannot
+	// both credit the inviter. The claim is released below when the payout
+	// cannot be made, which keeps the rebate retryable instead of silently
+	// dropped.
+	// Rows created before the column existed hold NULL, which never matches
+	// "= 0", so both states must be claimable.
+	claimed := tx.Model(&User{}).
+		Where("id = ? AND (first_topup_rebated = ? OR first_topup_rebated IS NULL)", userId, 0).
+		Update("first_topup_rebated", 1)
+	if claimed.Error != nil {
+		return claimed.Error
+	}
+	if claimed.RowsAffected == 0 {
+		return nil
+	}
+
+	releaseClaim := func() {
+		if undo := tx.Model(&User{}).Where("id = ?", userId).
+			Update("first_topup_rebated", 0); undo.Error != nil {
+			common.SysError(common.LogText(
+				"failed to release first top-up rebate claim for user %d: %s",
+				userId, undo.Error.Error()))
+		}
+	}
+
+	result := tx.Model(&User{}).Where("id = ?", user.InviterId).Updates(map[string]any{
+		"aff_quota":   gorm.Expr("aff_quota + ?", rebate),
+		"aff_history": gorm.Expr("aff_history + ?", rebate),
+	})
+	if result.Error != nil {
+		// Never fail the payer's top-up over an affiliate payout.
+		common.SysError(common.LogText(
+			"first top-up rebate failed: inviter %d for user %d: %s",
+			user.InviterId, userId, result.Error.Error()))
+		releaseClaim()
+		return nil
+	}
+	if result.RowsAffected == 0 {
+		// The inviter is gone, so there is nobody to pay.
+		common.SysError(common.LogText(
+			"first top-up rebate skipped: inviter %d unavailable for user %d (rebate %d)",
+			user.InviterId, userId, rebate))
+		releaseClaim()
+		return nil
+	}
+	return nil
+}
+
 // creditTopUpQuota atomically enforces the wallet ceiling while adding quota.
 // Keeping the predicate and increment in one UPDATE prevents two
 // concurrent callbacks from both passing a separate read/check.
@@ -104,6 +166,9 @@ func creditTopUpQuota(tx *gorm.DB, userId int, creditedQuota int, updates map[st
 		return result.Error
 	}
 	if result.RowsAffected == 1 {
+		if err := creditFirstTopupRebate(tx, userId, creditedQuota); err != nil {
+			return err
+		}
 		return nil
 	}
 
