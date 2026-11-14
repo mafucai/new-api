@@ -103,6 +103,8 @@ type User struct {
 	AffQuota             int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
 	AffHistoryQuota      int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
 	InviterId            int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	FirstTopupRebated    int                        `json:"-" gorm:"column:first_topup_rebated"`
+	InvitationRewarded   int                        `json:"-" gorm:"column:invitation_rewarded"`
 	DeletedAt            gorm.DeletedAt             `gorm:"index"`
 	LinuxDOId            string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting              string                     `json:"setting" gorm:"type:text;column:setting"`
@@ -569,19 +571,41 @@ func HardDeleteUserById(id int) (int64, error) {
 	return user.HardDelete()
 }
 
-func inviteUser(inviterId int) error {
-	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
-		"aff_count":   gorm.Expr("aff_count + ?", 1),
-		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
-		"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
+// inviteUser credits each persisted invitation once, including OAuth finalizer replay.
+// Claim and reward share a transaction: a failed credit leaves the claim retryable.
+func inviteUser(inviterId int, inviteeId int) error {
+	if inviterId == 0 || inviterId == inviteeId || common.QuotaForInviter <= 0 {
+		return nil
+	}
+	reward := common.QuotaForInviter
+	if err := common.ValidateWalletQuota(reward); err != nil {
+		return err
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		claimed := tx.Model(&User{}).
+			Where("id = ? AND inviter_id = ? AND (invitation_rewarded = ? OR invitation_rewarded IS NULL)", inviteeId, inviterId, 0).
+			Update("invitation_rewarded", 1)
+		if claimed.Error != nil {
+			return claimed.Error
+		}
+		if claimed.RowsAffected == 0 {
+			return nil
+		}
+		result := tx.Model(&User{}).
+			Where("id = ? AND aff_quota <= ? AND aff_history <= ?", inviterId, common.MaxWalletQuota-reward, common.MaxWalletQuota-reward).
+			Updates(map[string]any{
+				"aff_count":   gorm.Expr("aff_count + ?", 1),
+				"aff_quota":   gorm.Expr("aff_quota + ?", reward),
+				"aff_history": gorm.Expr("aff_history + ?", reward),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("inviter not found or invitation reward exceeds wallet limit")
+		}
+		return nil
 	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }
 
 func (user *User) TransferAffQuotaToQuota(quota int) error {
@@ -717,6 +741,7 @@ func (user *User) finishInsert(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
+	GrantSignupTrialSubscription(user.Id)
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
 		if common.QuotaForInvitee > 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
@@ -725,13 +750,55 @@ func (user *User) finishInsert(inviterId int) {
 		if common.QuotaForInviter > 0 {
 			//_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
 			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
+			if err := inviteUser(inviterId, user.Id); err != nil {
+				common.SysError(common.LogText("invitation reward failed for user %d: %s", user.Id, err.Error()))
+			}
 		}
 	}
 }
 
 func (user *User) FinishInsert(inviterId int) {
 	user.finishInsert(inviterId)
+}
+
+// GrantSignupTrialSubscription gives a freshly registered user the configured
+// trial plan so they can use the trial group for a limited time without paying.
+// The plan is optional: when no plan id is configured the call is a no-op, and
+// any failure is logged rather than surfaced, because a missing trial must not
+// block registration.
+func GrantSignupTrialSubscription(userId int) {
+	planId := common.SignupTrialPlanId
+	if planId <= 0 || userId <= 0 {
+		return
+	}
+	var plan SubscriptionPlan
+	if err := DB.Where("id = ? AND enabled = ?", planId, true).First(&plan).Error; err != nil {
+		common.SysError(common.LogText("signup trial skipped: plan %d unavailable: %s", planId, err.Error()))
+		return
+	}
+	var existing int64
+	if err := DB.Model(&UserSubscription{}).
+		Where("user_id = ? AND plan_id = ?", userId, planId).
+		Count(&existing).Error; err != nil {
+		common.SysError(common.LogText("signup trial skipped: count failed for user %d: %s", userId, err.Error()))
+		return
+	}
+	if existing > 0 {
+		return
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		_, err := CreateUserSubscriptionFromPlanTx(tx, userId, &plan, "signup_trial")
+		return err
+	})
+	if err != nil {
+		common.SysError(common.LogText("signup trial failed for user %d (plan %d): %s", userId, planId, err.Error()))
+		return
+	}
+	refreshSubscriptionUserGroupCache(userId, common.LogText("signup trial"))
+	RecordLog(userId, LogTypeSystem, common.NewMessage("Sign-up trial activated: {{title}} ({{hours}}h)", map[string]any{
+		"title": plan.Title,
+		"hours": plan.DurationValue,
+	}))
 }
 
 // InsertWithTx inserts a new user within an existing transaction.
@@ -774,6 +841,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
+	GrantSignupTrialSubscription(user.Id)
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
 		if common.QuotaForInvitee > 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
@@ -781,7 +849,9 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 		}
 		if common.QuotaForInviter > 0 {
 			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
+			if err := inviteUser(inviterId, user.Id); err != nil {
+				common.SysError(common.LogText("invitation reward failed for user %d: %s", user.Id, err.Error()))
+			}
 		}
 	}
 }

@@ -623,3 +623,51 @@ func TestValidateAuthSessionWithTxChecksAccessTokenIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestInvitationRegistrationRewardsEachInviteeOnce(t *testing.T) {
+	setupUserUpdateTestState(t)
+	require.NoError(t, DB.AutoMigrate(&User{}))
+	oldReward := common.QuotaForInviter
+	common.QuotaForInviter = 500000
+	t.Cleanup(func() { common.QuotaForInviter = oldReward })
+
+	inviter := User{Username: "signup-inviter", Password: "unused", AffCode: "signup-inviter"}
+	require.NoError(t, DB.Create(&inviter).Error)
+	for _, name := range []string{"signup-invitee-1", "signup-invitee-2"} {
+		invitee := User{Username: name, Password: "unused", AffCode: name, InviterId: inviter.Id}
+		require.NoError(t, DB.Create(&invitee).Error)
+		require.NoError(t, inviteUser(inviter.Id, invitee.Id))
+		require.NoError(t, inviteUser(inviter.Id, invitee.Id))
+	}
+	var got User
+	require.NoError(t, DB.First(&got, inviter.Id).Error)
+	assert.Equal(t, 2, got.AffCount)
+	assert.Equal(t, 1000000, got.AffQuota)
+	assert.Equal(t, 1000000, got.AffHistoryQuota)
+	assert.Zero(t, got.Quota) // Rewards stay in the transferable affiliate account.
+}
+
+func TestInvitationRewardRejectsWrongInviterAndRollsBackOverflow(t *testing.T) {
+	setupUserUpdateTestState(t)
+	require.NoError(t, DB.AutoMigrate(&User{}))
+	oldReward := common.QuotaForInviter
+	common.QuotaForInviter = 500000
+	t.Cleanup(func() { common.QuotaForInviter = oldReward })
+
+	inviter := User{Username: "full-inviter", Password: "unused", AffCode: "full-inviter", AffQuota: common.MaxWalletQuota}
+	require.NoError(t, DB.Create(&inviter).Error)
+	invitee := User{Username: "reward-invitee", Password: "unused", AffCode: "reward-invitee", InviterId: inviter.Id}
+	require.NoError(t, DB.Create(&invitee).Error)
+	require.NoError(t, inviteUser(invitee.Id, invitee.Id)) // No self-invitation.
+	require.NoError(t, inviteUser(inviter.Id+10000, invitee.Id))
+	require.Error(t, inviteUser(inviter.Id, invitee.Id))
+	var got User
+	require.NoError(t, DB.First(&got, invitee.Id).Error)
+	assert.Zero(t, got.InvitationRewarded)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", inviter.Id).Update("aff_quota", 0).Error)
+	require.NoError(t, inviteUser(inviter.Id, invitee.Id))
+	got = User{}
+	require.NoError(t, DB.First(&got, inviter.Id).Error)
+	assert.Equal(t, 1, got.AffCount)
+	assert.Equal(t, 500000, got.AffQuota)
+}
