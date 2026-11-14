@@ -11,6 +11,24 @@ import (
 
 // resetTrialTables clears the rows these tests create. truncateTables only
 // registers a t.Cleanup hook, so it cannot be used to prepare a test case.
+// allowPoolGrowth raises the connection limit for the duration of one test.
+//
+// The shared TestMain caps the pool at a single connection. GrantSignupTrialSubscription
+// runs CreateUserSubscriptionFromPlanTx inside a transaction, and that helper calls
+// model.GetDBTimestamp(), which issues its query on the global DB handle instead of
+// the transaction. With one connection the timestamp query waits forever on the
+// connection its own transaction holds.
+func allowPoolGrowth(t *testing.T) {
+	t.Helper()
+	sqlDB, err := DB.DB()
+	require.NoError(t, err)
+	previous := sqlDB.Stats().MaxOpenConnections
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() {
+		sqlDB.SetMaxOpenConns(previous)
+	})
+}
+
 func resetTrialTables(t *testing.T) {
 	t.Helper()
 	clearTrialTables()
@@ -67,6 +85,7 @@ func newTrialTestPlan(t *testing.T, upgradeGroup string) *SubscriptionPlan {
 
 func TestGrantSignupTrialSubscriptionBindsPlanOnce(t *testing.T) {
 	resetTrialTables(t)
+	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
@@ -94,6 +113,7 @@ func TestGrantSignupTrialSubscriptionBindsPlanOnce(t *testing.T) {
 
 func TestGrantSignupTrialSubscriptionDisabledWithoutPlan(t *testing.T) {
 	resetTrialTables(t)
+	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
@@ -109,6 +129,7 @@ func TestGrantSignupTrialSubscriptionDisabledWithoutPlan(t *testing.T) {
 
 func TestGrantSignupTrialSubscriptionIgnoresMissingPlan(t *testing.T) {
 	resetTrialTables(t)
+	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
@@ -126,6 +147,7 @@ func TestGrantSignupTrialSubscriptionIgnoresMissingPlan(t *testing.T) {
 
 func TestGrantSignupTrialSubscriptionMovesUserToUpgradeGroup(t *testing.T) {
 	resetTrialTables(t)
+	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
