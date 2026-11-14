@@ -776,22 +776,32 @@ func GrantSignupTrialSubscription(userId int) {
 		common.SysError(common.LogText("signup trial skipped: plan %d unavailable: %s", planId, err.Error()))
 		return
 	}
-	var existing int64
-	if err := DB.Model(&UserSubscription{}).
-		Where("user_id = ? AND plan_id = ?", userId, planId).
-		Count(&existing).Error; err != nil {
-		common.SysError(common.LogText("signup trial skipped: count failed for user %d: %s", userId, err.Error()))
-		return
-	}
-	if existing > 0 {
-		return
-	}
+
+	// Everything after reading the plan must share one transaction: the test
+	// harness caps the pool at a single connection, so a query issued outside
+	// the transaction blocks the transaction's own BEGIN forever.
+	granted := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		_, err := CreateUserSubscriptionFromPlanTx(tx, userId, &plan, "signup_trial")
-		return err
+		var existing int64
+		if err := tx.Model(&UserSubscription{}).
+			Where("user_id = ? AND plan_id = ?", userId, planId).
+			Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing > 0 {
+			return nil
+		}
+		if _, err := CreateUserSubscriptionFromPlanTx(tx, userId, &plan, "signup_trial"); err != nil {
+			return err
+		}
+		granted = true
+		return nil
 	})
 	if err != nil {
 		common.SysError(common.LogText("signup trial failed for user %d (plan %d): %s", userId, planId, err.Error()))
+		return
+	}
+	if !granted {
 		return
 	}
 	refreshSubscriptionUserGroupCache(userId, common.LogText("signup trial"))

@@ -6,22 +6,28 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // resetTrialTables clears the rows these tests create. truncateTables only
 // registers a t.Cleanup hook, so it cannot be used to prepare a test case.
 func resetTrialTables(t *testing.T) {
 	t.Helper()
-	require.NoError(t, DB.AutoMigrate(&User{}, &UserSubscription{}, &SubscriptionPlan{}, &Log{}))
-	DB.Exec("DELETE FROM user_subscriptions")
-	DB.Exec("DELETE FROM subscription_plans")
-	DB.Exec("DELETE FROM logs")
-	DB.Exec("DELETE FROM users")
+	clearTrialTables()
 	t.Cleanup(func() {
-		DB.Exec("DELETE FROM user_subscriptions")
-		DB.Exec("DELETE FROM subscription_plans")
-		DB.Exec("DELETE FROM logs")
-		DB.Exec("DELETE FROM users")
+		clearTrialTables()
+	})
+}
+
+// clearTrialTables deletes inside one transaction. The harness caps the pool at
+// a single connection, so issuing these as separate statements risks waiting on
+// a connection that the previous statement has not released yet.
+func clearTrialTables() {
+	_ = DB.Transaction(func(tx *gorm.DB) error {
+		tx.Exec("DELETE FROM user_subscriptions")
+		tx.Exec("DELETE FROM subscription_plans")
+		tx.Exec("DELETE FROM logs")
+		return tx.Exec("DELETE FROM users").Error
 	})
 }
 
