@@ -1,12 +1,22 @@
 package model
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
+)
+
+// trialTestMu serializes the signup-trial cases. They share one database and
+// each starts by deleting its own fixtures, so running them concurrently would
+// let one case delete another's rows mid-run.
+var trialTestMu sync.Mutex
+
+const (
+	trialUsernamePrefix = "signup-trial-"
+	trialPlanTitle      = "signup trial"
 )
 
 // allowPoolGrowth raises the connection limit for the duration of one test.
@@ -20,10 +30,11 @@ func allowPoolGrowth(t *testing.T) {
 	t.Helper()
 	sqlDB, err := DB.DB()
 	require.NoError(t, err)
-	previous := sqlDB.Stats().MaxOpenConnections
 	sqlDB.SetMaxOpenConns(4)
 	t.Cleanup(func() {
-		sqlDB.SetMaxOpenConns(previous)
+		// TestMain pins the pool at one connection; restore that, not the
+		// widened value Stats() would report here.
+		sqlDB.SetMaxOpenConns(1)
 	})
 }
 
@@ -31,22 +42,20 @@ func allowPoolGrowth(t *testing.T) {
 // registers a t.Cleanup hook, so it cannot be used to prepare a test case.
 func resetTrialTables(t *testing.T) {
 	t.Helper()
-	clearTrialTables()
+	require.NoError(t, DB.AutoMigrate(&User{}, &UserSubscription{}, &SubscriptionPlan{}, &Log{}))
+	deleteTrialFixtures()
 	t.Cleanup(func() {
-		clearTrialTables()
+		deleteTrialFixtures()
 	})
 }
 
-// clearTrialTables deletes inside one transaction. The harness caps the pool at
-// a single connection, so issuing these as separate statements risks waiting on
-// a connection that the previous statement has not released yet.
-func clearTrialTables() {
-	_ = DB.Transaction(func(tx *gorm.DB) error {
-		tx.Exec("DELETE FROM user_subscriptions")
-		tx.Exec("DELETE FROM subscription_plans")
-		tx.Exec("DELETE FROM logs")
-		return tx.Exec("DELETE FROM users").Error
-	})
+// deleteTrialFixtures removes only the rows these tests create. Deleting whole
+// tables would break every other test that shares this database, and the
+// harness runs them concurrently.
+func deleteTrialFixtures() {
+	DB.Where("username LIKE ?", trialUsernamePrefix+"%").Delete(&User{})
+	DB.Where("title = ?", trialPlanTitle).Delete(&SubscriptionPlan{})
+	DB.Where("source = ?", "signup_trial").Delete(&UserSubscription{})
 }
 
 func newTrialTestUser(t *testing.T, name string) *User {
@@ -68,7 +77,7 @@ func newTrialTestPlan(t *testing.T, upgradeGroup string) *SubscriptionPlan {
 	t.Helper()
 	overlap := false
 	plan := &SubscriptionPlan{
-		Title:               "signup trial",
+		Title:               trialPlanTitle,
 		PriceAmount:         0,
 		Currency:            "USD",
 		DurationUnit:        "hour",
@@ -84,13 +93,15 @@ func newTrialTestPlan(t *testing.T, upgradeGroup string) *SubscriptionPlan {
 }
 
 func TestGrantSignupTrialSubscriptionBindsPlanOnce(t *testing.T) {
+	trialTestMu.Lock()
+	t.Cleanup(trialTestMu.Unlock)
 	resetTrialTables(t)
 	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
 	plan := newTrialTestPlan(t, "")
-	user := newTrialTestUser(t, "trial-bind-user")
+	user := newTrialTestUser(t, trialUsernamePrefix+"bind")
 	common.SignupTrialPlanId = plan.Id
 
 	GrantSignupTrialSubscription(user.Id)
@@ -112,12 +123,14 @@ func TestGrantSignupTrialSubscriptionBindsPlanOnce(t *testing.T) {
 }
 
 func TestGrantSignupTrialSubscriptionDisabledWithoutPlan(t *testing.T) {
+	trialTestMu.Lock()
+	t.Cleanup(trialTestMu.Unlock)
 	resetTrialTables(t)
 	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
-	user := newTrialTestUser(t, "trial-disabled-user")
+	user := newTrialTestUser(t, trialUsernamePrefix+"disabled")
 	common.SignupTrialPlanId = 0
 
 	GrantSignupTrialSubscription(user.Id)
@@ -128,12 +141,14 @@ func TestGrantSignupTrialSubscriptionDisabledWithoutPlan(t *testing.T) {
 }
 
 func TestGrantSignupTrialSubscriptionIgnoresMissingPlan(t *testing.T) {
+	trialTestMu.Lock()
+	t.Cleanup(trialTestMu.Unlock)
 	resetTrialTables(t)
 	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
-	user := newTrialTestUser(t, "trial-missing-plan-user")
+	user := newTrialTestUser(t, trialUsernamePrefix+"missing-plan")
 	common.SignupTrialPlanId = 999999
 
 	// Must not panic or fail the caller; a broken plan reference cannot be
@@ -146,13 +161,15 @@ func TestGrantSignupTrialSubscriptionIgnoresMissingPlan(t *testing.T) {
 }
 
 func TestGrantSignupTrialSubscriptionMovesUserToUpgradeGroup(t *testing.T) {
+	trialTestMu.Lock()
+	t.Cleanup(trialTestMu.Unlock)
 	resetTrialTables(t)
 	allowPoolGrowth(t)
 	previous := common.SignupTrialPlanId
 	t.Cleanup(func() { common.SignupTrialPlanId = previous })
 
 	plan := newTrialTestPlan(t, "default") // reuse an existing group
-	user := newTrialTestUser(t, "trial-group-user")
+	user := newTrialTestUser(t, trialUsernamePrefix+"group")
 	common.SignupTrialPlanId = plan.Id
 
 	GrantSignupTrialSubscription(user.Id)
