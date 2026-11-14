@@ -741,6 +741,7 @@ func (user *User) finishInsert(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
+	GrantSignupTrialSubscription(user.Id)
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
 		if common.QuotaForInvitee > 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
@@ -758,6 +759,46 @@ func (user *User) finishInsert(inviterId int) {
 
 func (user *User) FinishInsert(inviterId int) {
 	user.finishInsert(inviterId)
+}
+
+// GrantSignupTrialSubscription gives a freshly registered user the configured
+// trial plan so they can use the trial group for a limited time without paying.
+// The plan is optional: when no plan id is configured the call is a no-op, and
+// any failure is logged rather than surfaced, because a missing trial must not
+// block registration.
+func GrantSignupTrialSubscription(userId int) {
+	planId := common.SignupTrialPlanId
+	if planId <= 0 || userId <= 0 {
+		return
+	}
+	var plan SubscriptionPlan
+	if err := DB.Where("id = ? AND enabled = ?", planId, true).First(&plan).Error; err != nil {
+		common.SysError(common.LogText("signup trial skipped: plan %d unavailable: %s", planId, err.Error()))
+		return
+	}
+	var existing int64
+	if err := DB.Model(&UserSubscription{}).
+		Where("user_id = ? AND plan_id = ?", userId, planId).
+		Count(&existing).Error; err != nil {
+		common.SysError(common.LogText("signup trial skipped: count failed for user %d: %s", userId, err.Error()))
+		return
+	}
+	if existing > 0 {
+		return
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		_, err := CreateUserSubscriptionFromPlanTx(tx, userId, &plan, "signup_trial")
+		return err
+	})
+	if err != nil {
+		common.SysError(common.LogText("signup trial failed for user %d (plan %d): %s", userId, planId, err.Error()))
+		return
+	}
+	refreshSubscriptionUserGroupCache(userId, common.LogText("signup trial"))
+	RecordLog(userId, LogTypeSystem, common.NewMessage("Sign-up trial activated: {{title}} ({{hours}}h)", map[string]any{
+		"title": plan.Title,
+		"hours": plan.DurationValue,
+	}))
 }
 
 // InsertWithTx inserts a new user within an existing transaction.
@@ -800,6 +841,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
+	GrantSignupTrialSubscription(user.Id)
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
 		if common.QuotaForInvitee > 0 {
 			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)

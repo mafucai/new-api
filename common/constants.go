@@ -132,6 +132,10 @@ var TelegramBotName = ""
 var QuotaForNewUser = 500000
 var QuotaForInviter = 500000
 var QuotaForInvitee = 0
+// SignupTrialPlanId auto-grants this subscription plan to every new account.
+// 0 disables the trial; the plan itself defines the duration, quota cap and
+// group, so the trial needs no extra configuration.
+var SignupTrialPlanId = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false
