@@ -280,6 +280,23 @@ type UserSubscription struct {
 	UpdatedAt int64 `json:"updated_at" gorm:"bigint"`
 }
 
+// SuspendTrialSubscription disables the active signup trial without banning
+// the account. It is intentionally best-effort for risk controls: paid access
+// and the account itself remain unaffected.
+func SuspendTrialSubscription(userId int, reason string) {
+	if userId <= 0 {
+		return
+	}
+	err := DB.Model(&UserSubscription{}).
+		Where("user_id = ? AND source = ? AND status = ?", userId, "signup_trial", "active").
+		Updates(map[string]any{"status": "cancelled", "downgrade_group": "default"}).Error
+	if err != nil {
+		common.SysError(common.LogText("failed to suspend trial for user %d: %s", userId, err.Error()))
+		return
+	}
+	common.SysLog(common.LogText("trial suspended for user %d: %s", userId, reason))
+}
+
 func (s *UserSubscription) BeforeCreate(tx *gorm.DB) error {
 	now := common.GetTimestamp()
 	s.CreatedAt = now
