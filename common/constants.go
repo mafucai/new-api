@@ -136,6 +136,10 @@ var QuotaForInvitee = 0
 // 0 disables the trial; the plan itself defines the duration, quota cap and
 // group, so the trial needs no extra configuration.
 var SignupTrialPlanId = 0
+// SignupRiskEnabled controls optional anti-abuse checks for trial access.
+// Keep it disabled while onboarding users; enabling it only pauses trial
+// benefits and never bans accounts.
+var SignupRiskEnabled = false
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false

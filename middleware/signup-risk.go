@@ -24,6 +24,10 @@ const signupRiskContextKey = "trial_signup_risk_reason"
 // the reason to revoke only the free trial subscription after creation.
 func SignupRiskCheck() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !common.SignupRiskEnabled {
+			c.Next()
+			return
+		}
 		if common.RedisEnabled && common.RDB != nil {
 			key := fmt.Sprintf("trialRisk:signup:%s", c.ClientIP())
 			count, err := common.RDB.Incr(context.Background(), key).Result()
@@ -45,7 +49,7 @@ func SignupRiskCheck() gin.HandlerFunc {
 // the account itself remains usable for paid access.
 func TrialCallRisk() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.GetString("user_group") != "trial" || !common.RedisEnabled || common.RDB == nil {
+		if !common.SignupRiskEnabled || c.GetString("user_group") != "trial" || !common.RedisEnabled || common.RDB == nil {
 			c.Next()
 			return
 		}
