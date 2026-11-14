@@ -9,8 +9,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// resetTrialTables clears the rows these tests create. truncateTables only
-// registers a t.Cleanup hook, so it cannot be used to prepare a test case.
 // allowPoolGrowth raises the connection limit for the duration of one test.
 //
 // The shared TestMain caps the pool at a single connection. GrantSignupTrialSubscription
@@ -29,6 +27,8 @@ func allowPoolGrowth(t *testing.T) {
 	})
 }
 
+// resetTrialTables clears the rows these tests create. truncateTables only
+// registers a t.Cleanup hook, so it cannot be used to prepare a test case.
 func resetTrialTables(t *testing.T) {
 	t.Helper()
 	clearTrialTables()
