@@ -291,6 +291,9 @@ func Register(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if reason := middleware.SignupRiskReason(c); reason != "" {
+		model.SuspendTrialSubscription(cleanUser.Id, reason)
+	}
 
 	// 获取插入后的用户ID
 	var insertedUser model.User

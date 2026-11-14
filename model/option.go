@@ -144,6 +144,8 @@ func InitOptionMap() {
 	common.OptionMap["TurnstileSiteKey"] = ""
 	common.OptionMap["TurnstileSecretKey"] = ""
 	common.OptionMap["QuotaForNewUser"] = strconv.Itoa(common.QuotaForNewUser)
+	common.OptionMap["SignupTrialPlanId"] = strconv.Itoa(common.SignupTrialPlanId)
+	common.OptionMap["SignupRiskEnabled"] = strconv.FormatBool(common.SignupRiskEnabled)
 	common.OptionMap["QuotaForInviter"] = strconv.Itoa(common.QuotaForInviter)
 	common.OptionMap["QuotaForInvitee"] = strconv.Itoa(common.QuotaForInvitee)
 	common.OptionMap["QuotaRemindEnabled"] = strconv.FormatBool(common.QuotaRemindEnabled)
@@ -637,6 +639,10 @@ func updateOptionMap(key string, value string) (err error) {
 		common.TurnstileSecretKey = value
 	case "QuotaForNewUser":
 		common.QuotaForNewUser, _ = strconv.Atoi(value)
+	case "SignupTrialPlanId":
+		common.SignupTrialPlanId, _ = strconv.Atoi(value)
+	case "SignupRiskEnabled":
+		common.SignupRiskEnabled, _ = strconv.ParseBool(value)
 	case "QuotaForInviter":
 		common.QuotaForInviter, _ = strconv.Atoi(value)
 	case "QuotaForInvitee":
